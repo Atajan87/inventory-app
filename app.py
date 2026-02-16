@@ -1,341 +1,317 @@
-import json  # <--- ДОБАВИТЬ ЭТУ СТРОКУ
 import streamlit as st
 import pandas as pd
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime, date
-import plotly.express as px # Для красивых графиков
+import plotly.express as px
+import json
 
-# --- КОНФИГУРАЦИЯ ---
-st.set_page_config(page_title="Склад Pro: Отчеты и Статистика", layout="wide")
-
-# ПАРОЛЬ ДЛЯ СБРОСА БАЗЫ
-ADMIN_PASSWORD = "admin123" 
+# ==========================================
+# 1. НАСТРОЙКИ И КОНФИГУРАЦИЯ
+# ==========================================
+st.set_page_config(page_title="Склад Pro: Облако", layout="wide", initial_sidebar_state="expanded")
 
 # Имя вашей Google Таблицы
 SPREADSHEET_NAME = "Store_03_Database"
 
-# --- ПОДКЛЮЧЕНИЕ К GOOGLE SHEETS ---
-# --- НОВАЯ БРОНЕБОЙНАЯ ФУНКЦИЯ ПОДКЛЮЧЕНИЯ ---
+# Пароль для сброса базы
+ADMIN_PASSWORD = "admin"
+
+# ==========================================
+# 2. ПОДКЛЮЧЕНИЕ К GOOGLE (Самая важная часть)
+# ==========================================
 @st.cache_resource
 def get_connection():
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
     
-    # 1. Читаем секрет как строку JSON
-    if "service_account_json" in st.secrets:
+    # Сценарий А: Запуск в облаке (Streamlit Cloud)
+    if "gcp_service_account" in st.secrets:
+        # Превращаем объект secrets в обычный словарь Python
+        creds_dict = dict(st.secrets["gcp_service_account"])
+        
+        # ЛЕЧЕНИЕ КЛЮЧА: Исправляем переносы строк, которые ломаются при копировании
+        if "private_key" in creds_dict:
+            # Заменяем экранированные \n на реальные переносы
+            key = creds_dict["private_key"]
+            creds_dict["private_key"] = key.replace("\\n", "\n")
+        
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+    
+    # Сценарий Б: Запуск на компьютере (Локально)
+    else:
         try:
-            # Превращаем текст обратно в словарь
-            creds_dict = json.loads(st.secrets["service_account_json"])
-            creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-        except json.JSONDecodeError as e:
-            st.error(f"Ошибка в формате JSON в Secrets: {e}")
+            creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
+        except FileNotFoundError:
+            st.error("❌ Ошибка: Не найден файл credentials.json и нет секретов в облаке.")
             st.stop()
             
-    # 2. Локальный файл (если запускаем с компа)
-    else:
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(json.load(open("credentials.json")), scope)
-        
     client = gspread.authorize(creds)
     return client
 
+# ==========================================
+# 3. РАБОТА С ДАННЫМИ
+# ==========================================
 def load_data():
     client = get_connection()
     try:
         sh = client.open(SPREADSHEET_NAME)
     except gspread.SpreadsheetNotFound:
-        st.error(f"❌ Таблица '{SPREADSHEET_NAME}' не найдена!")
+        st.error(f"❌ Не могу найти таблицу: {SPREADSHEET_NAME}. Проверьте название в Google.")
         st.stop()
 
-    def read_sheet(worksheet_name, columns):
+    # Функция чтения листа с защитой от пустоты
+    def read_sheet(name, cols):
         try:
-            ws = sh.worksheet(worksheet_name)
+            ws = sh.worksheet(name)
             data = ws.get_all_records()
             if not data:
-                return pd.DataFrame(columns=columns)
+                return pd.DataFrame(columns=cols)
             return pd.DataFrame(data)
         except gspread.WorksheetNotFound:
-            ws = sh.add_worksheet(title=worksheet_name, rows=1000, cols=10)
-            ws.append_row(columns)
-            return pd.DataFrame(columns=columns)
+            ws = sh.add_worksheet(title=name, rows=1000, cols=10)
+            ws.append_row(cols)
+            return pd.DataFrame(columns=cols)
 
+    # Читаем 3 листа
     df_store = read_sheet("Store", ['Unic_Mat_№', 'Description', 'Place', 'Unit', 'Reminder', 'Price', 'Group', 'Remarks'])
     df_in = read_sheet("In", ['Unic_Mat_№', 'Description', 'QTY', 'Date', 'Delivery_man', 'Remarks'])
     df_out = read_sheet("Out", ['Unic_Mat_№', 'Description', 'QTY', 'Date', 'Applicant', 'Remarks'])
 
-    # Преобразование типов данных
+    # Чистим типы данных
     df_store['Reminder'] = pd.to_numeric(df_store['Reminder'], errors='coerce').fillna(0)
     df_store['Price'] = pd.to_numeric(df_store['Price'], errors='coerce').fillna(0)
     
-    # Преобразование дат
+    # Даты
     df_in['Date'] = pd.to_datetime(df_in['Date'], errors='coerce').dt.date
     df_out['Date'] = pd.to_datetime(df_out['Date'], errors='coerce').dt.date
 
     return df_store, df_in, df_out
 
 def save_sheet(df, worksheet_name):
+    """Сохраняет DataFrame обратно в Google Sheet"""
     client = get_connection()
     sh = client.open(SPREADSHEET_NAME)
     ws = sh.worksheet(worksheet_name)
-    ws.clear()
-    # Подготовка данных для записи (превращаем даты в строки обратно)
+    
+    # Конвертируем даты в строки перед отправкой, чтобы JSON не ломался
     df_export = df.copy()
     if 'Date' in df_export.columns:
         df_export['Date'] = df_export['Date'].astype(str)
         
+    ws.clear()
     ws.update([df_export.columns.values.tolist()] + df_export.values.tolist())
 
-# --- ЗАГРУЗКА ДАННЫХ ---
+# ==========================================
+# 4. ИНТЕРФЕЙС ПРИЛОЖЕНИЯ
+# ==========================================
+
+# Инициализация данных
 if 'data_loaded' not in st.session_state:
-    with st.spinner('Связь с сервером Google...'):
+    with st.spinner('📡 Соединение с сервером Google...'):
         st.session_state.df_store, st.session_state.df_in, st.session_state.df_out = load_data()
     st.session_state.data_loaded = True
 
-# Кнопка принудительного обновления
+# Кнопка обновления в сайдбаре
 with st.sidebar:
-    if st.button("🔄 Обновить данные из Облака"):
+    st.title("🗂 Меню Склада")
+    if st.button("🔄 Обновить данные", type="primary"):
         st.cache_resource.clear()
         st.session_state.data_loaded = False
         st.rerun()
 
-# --- МЕНЮ ---
-st.sidebar.title("🗂 Меню Склада")
-page = st.sidebar.radio("Перейти:", 
-    ["📊 Статистика (Dash)", 
-     "📦 Склад (Остатки)", 
-     "🔄 Приход / Расход", 
-     "🖨️ Отчеты и Печать", 
-     "⚙️ Настройки (Сброс)"]
+# Навигация
+page = st.sidebar.radio("Перейти к разделу:", 
+    ["📊 Статистика", "📦 Склад (Остатки)", "📝 Операции (Приход/Расход)", "🖨️ Отчеты", "⚙️ Настройки"]
 )
 
-# ==========================================
-# 1. СТАТИСТИКА (DASHBOARD)
-# ==========================================
-if page == "📊 Статистика (Dash)":
-    st.title("📊 Аналитика Склада")
-    
+# --- 1. СТАТИСТИКА ---
+if page == "📊 Статистика":
+    st.title("📊 Панель управления")
     df_s = st.session_state.df_store
     df_o = st.session_state.df_out
 
     # Метрики
-    total_items = len(df_s)
-    total_money = (df_s['Reminder'] * df_s['Price']).sum()
-    zero_stock = len(df_s[df_s['Reminder'] <= 0])
-
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Всего позиций", total_items)
-    col2.metric("Общая стоимость (¥)", f"{total_money:,.2f}")
-    col3.metric("Нет в наличии", zero_stock, delta_color="inverse")
+    kpi1, kpi2, kpi3 = st.columns(3)
+    kpi1.metric("Всего позиций", len(df_s))
+    kpi2.metric("Сумма склада (¥)", f"{ (df_s['Reminder'] * df_s['Price']).sum():,.0f}")
+    kpi3.metric("Закончились (0 шт)", len(df_s[df_s['Reminder'] <= 0]), delta_color="inverse")
 
     st.divider()
-
+    
     # Графики
-    col_g1, col_g2 = st.columns(2)
-    
-    with col_g1:
-        st.subheader("📉 Динамика расходов (последние 30 записей)")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.subheader("Топ-5 по расходу")
         if not df_o.empty:
-            daily_out = df_o.groupby('Date')['QTY'].sum().reset_index()
-            fig = px.bar(daily_out, x='Date', y='QTY', title="Количество выданных единиц по дням")
+            top = df_o.groupby('Description')['QTY'].sum().nlargest(5).reset_index()
+            fig = px.pie(top, values='QTY', names='Description', hole=0.4)
             st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("Нет данных о расходах")
-
-    with col_g2:
-        st.subheader("🏆 Топ-5 популярных товаров")
+    with c2:
+        st.subheader("Динамика выдачи")
         if not df_o.empty:
-            top_items = df_o.groupby('Description')['QTY'].sum().nlargest(5).reset_index()
-            fig2 = px.pie(top_items, values='QTY', names='Description', title="Доля выдачи")
+            daily = df_o.groupby('Date')['QTY'].sum().reset_index()
+            fig2 = px.bar(daily, x='Date', y='QTY')
             st.plotly_chart(fig2, use_container_width=True)
-        else:
-            st.info("Нет данных")
 
-# ==========================================
-# 2. СКЛАД (ОСТАТКИ)
-# ==========================================
+# --- 2. СКЛАД ---
 elif page == "📦 Склад (Остатки)":
-    st.title("📦 Текущие остатки")
-    search = st.text_input("🔍 Быстрый поиск")
+    st.title("📦 Полный список")
     
+    search = st.text_input("🔍 Поиск (ID или Название)")
     df = st.session_state.df_store
+    
     if search:
         mask = df.astype(str).apply(lambda x: x.str.contains(search, case=False)).any(axis=1)
         df_display = df[mask]
     else:
         df_display = df
 
+    # Редактируемая таблица
     edited_df = st.data_editor(
         df_display,
-        use_container_width=True,
         height=600,
+        use_container_width=True,
         column_config={
-            "Reminder": st.column_config.NumberColumn("Остаток", help="Не меняйте вручную, лучше используйте Приход/Расход"),
-            "Price": st.column_config.NumberColumn("Цена ¥", format="%.2f"),
-            "Unic_Mat_№": st.column_config.TextColumn("ID", disabled=True)
+            "Unic_Mat_№": st.column_config.TextColumn("ID", disabled=True),
+            "Reminder": st.column_config.NumberColumn("Остаток", format="%d"),
+            "Price": st.column_config.NumberColumn("Цена", format="%.2f ¥"),
         }
     )
 
-    if st.button("💾 Сохранить правки"):
+    if st.button("💾 Сохранить изменения"):
         st.session_state.df_store.update(edited_df)
-        with st.spinner('Сохраняю...'):
+        with st.spinner("Сохраняю в Google..."):
             save_sheet(st.session_state.df_store, "Store")
-        st.success("Сохранено!")
+        st.success("✅ Данные обновлены!")
 
-# ==========================================
-# 3. ОПЕРАЦИИ (ПРИХОД / РАСХОД) + НОВЫЙ ТОВАР
-# ==========================================
-elif page == "🔄 Приход / Расход":
-    st.title("Операции с товаром")
+# --- 3. ОПЕРАЦИИ ---
+elif page == "📝 Операции (Приход/Расход)":
+    st.title("Движение товара")
     
-    mode = st.radio("Выберите действие:", ["📤 ВЫДАТЬ (Расход)", "📥 ПРИНЯТЬ (Приход)", "✨ СОЗДАТЬ НОВЫЙ ТОВАР"], horizontal=True)
+    mode = st.tabs(["📤 РАСХОД (Выдача)", "📥 ПРИХОД (Пополнение)", "✨ НОВЫЙ ТОВАР"])
     options = st.session_state.df_store['Unic_Mat_№'].astype(str) + " | " + st.session_state.df_store['Description'].astype(str)
 
-    # --- РАСХОД ---
-    if mode == "📤 ВЫДАТЬ (Расход)":
-        st.subheader("Списание со склада")
-        sel = st.selectbox("Какой товар выдать?", options)
+    # ВЫДАЧА
+    with mode[0]:
+        sel = st.selectbox("Что выдаем?", options, key="out_sel")
         if sel:
             id_ = sel.split(" | ")[0]
-            curr_stock = st.session_state.df_store.loc[st.session_state.df_store['Unic_Mat_№'] == id_, 'Reminder'].values[0]
+            curr = st.session_state.df_store.loc[st.session_state.df_store['Unic_Mat_№'] == id_, 'Reminder'].values[0]
             
-            if curr_stock <= 0:
-                st.error(f"Товара нет на складе! (0 шт)")
+            if curr <= 0:
+                st.error("⛔ Товара нет в наличии!")
             else:
-                st.info(f"Доступно: {curr_stock} шт.")
-                with st.form("out_f"):
-                    q = st.number_input("Количество", 1.0, float(curr_stock))
-                    who = st.text_input("Кому (Applicant)")
-                    rem = st.text_input("Назначение")
-                    if st.form_submit_button("Списать"):
-                        st.session_state.df_store.loc[st.session_state.df_store['Unic_Mat_№'] == id_, 'Reminder'] -= q
-                        new_row = {'Unic_Mat_№': id_, 'Description': sel.split(" | ")[1], 'QTY': q, 'Date': datetime.now().date(), 'Applicant': who, 'Remarks': rem}
-                        st.session_state.df_out = pd.concat([st.session_state.df_out, pd.DataFrame([new_row])], ignore_index=True)
+                st.info(f"Доступно: {curr}")
+                with st.form("out_form"):
+                    qty = st.number_input("Количество", 1.0, float(curr))
+                    who = st.text_input("Получатель")
+                    rem = st.text_input("Куда / Причина")
+                    
+                    if st.form_submit_button("🚀 Списать"):
+                        st.session_state.df_store.loc[st.session_state.df_store['Unic_Mat_№'] == id_, 'Reminder'] -= qty
+                        new_rec = {
+                            'Unic_Mat_№': id_, 'Description': sel.split(" | ")[1], 
+                            'QTY': qty, 'Date': date.today(), 'Applicant': who, 'Remarks': rem
+                        }
+                        st.session_state.df_out = pd.concat([st.session_state.df_out, pd.DataFrame([new_rec])], ignore_index=True)
                         save_sheet(st.session_state.df_store, "Store")
                         save_sheet(st.session_state.df_out, "Out")
                         st.success("Выдано!")
                         st.rerun()
 
-    # --- ПРИХОД ---
-    elif mode == "📥 ПРИНЯТЬ (Приход)":
-        st.subheader("Пополнение")
-        sel = st.selectbox("Какой товар пришел?", options)
-        if sel:
-            id_ = sel.split(" | ")[0]
-            with st.form("in_f"):
-                q = st.number_input("Количество", 1.0)
-                who = st.text_input("Кто привез")
-                rem = st.text_input("Инвойс")
-                if st.form_submit_button("Принять"):
-                    st.session_state.df_store.loc[st.session_state.df_store['Unic_Mat_№'] == id_, 'Reminder'] += q
-                    new_row = {'Unic_Mat_№': id_, 'Description': sel.split(" | ")[1], 'QTY': q, 'Date': datetime.now().date(), 'Delivery_man': who, 'Remarks': rem}
-                    st.session_state.df_in = pd.concat([st.session_state.df_in, pd.DataFrame([new_row])], ignore_index=True)
+    # ПОПОЛНЕНИЕ
+    with mode[1]:
+        sel_in = st.selectbox("Что пришло?", options, key="in_sel")
+        if sel_in:
+            id_in = sel_in.split(" | ")[0]
+            with st.form("in_form"):
+                qty = st.number_input("Количество", 1.0)
+                who = st.text_input("Доставщик")
+                rem = st.text_input("Инвойс / Инфо")
+                if st.form_submit_button("📥 Принять"):
+                    st.session_state.df_store.loc[st.session_state.df_store['Unic_Mat_№'] == id_in, 'Reminder'] += qty
+                    new_rec = {
+                        'Unic_Mat_№': id_in, 'Description': sel_in.split(" | ")[1], 
+                        'QTY': qty, 'Date': date.today(), 'Delivery_man': who, 'Remarks': rem
+                    }
+                    st.session_state.df_in = pd.concat([st.session_state.df_in, pd.DataFrame([new_rec])], ignore_index=True)
                     save_sheet(st.session_state.df_store, "Store")
                     save_sheet(st.session_state.df_in, "In")
                     st.success("Принято!")
                     st.rerun()
 
-    # --- НОВЫЙ ТОВАР ---
-    elif mode == "✨ СОЗДАТЬ НОВЫЙ ТОВАР":
-        st.subheader("Создание карточки")
-        with st.form("new_t"):
-            uid = st.text_input("ID (Unique No)")
-            desc = st.text_input("Описание")
-            place = st.text_input("Место (Place)")
-            price = st.number_input("Цена (Price)", 0.0)
-            if st.form_submit_button("Создать"):
+    # НОВЫЙ ТОВАР
+    with mode[2]:
+        with st.form("new_item"):
+            col1, col2 = st.columns(2)
+            uid = col1.text_input("ID (Unic_Mat_№)")
+            desc = col2.text_input("Описание (Description)")
+            
+            col3, col4, col5 = st.columns(3)
+            place = col3.text_input("Место (Place)")
+            price = col4.number_input("Цена", 0.0)
+            unit = col5.text_input("Ед. изм.", "ea")
+            
+            if st.form_submit_button("Создать карточку"):
                 if uid in st.session_state.df_store['Unic_Mat_№'].values:
-                    st.error("Такой ID уже есть!")
+                    st.error("Такой ID уже существует!")
                 else:
-                    new_row = {'Unic_Mat_№': uid, 'Description': desc, 'Place': place, 'Unit': 'ea', 'Reminder': 0, 'Price': price, 'Group': '', 'Remarks': ''}
+                    new_row = {
+                        'Unic_Mat_№': uid, 'Description': desc, 'Place': place, 
+                        'Unit': unit, 'Reminder': 0, 'Price': price, 'Group': '', 'Remarks': ''
+                    }
                     st.session_state.df_store = pd.concat([st.session_state.df_store, pd.DataFrame([new_row])], ignore_index=True)
                     save_sheet(st.session_state.df_store, "Store")
-                    st.success("Создано!")
+                    st.success("Товар создан!")
 
-# ==========================================
-# 4. ОТЧЕТЫ И ПЕЧАТЬ (НОВАЯ ФУНКЦИЯ)
-# ==========================================
-elif page == "🖨️ Отчеты и Печать":
-    st.title("🖨️ Генератор отчетов")
+# --- 4. ОТЧЕТЫ ---
+elif page == "🖨️ Отчеты":
+    st.title("Генератор отчетов")
     
-    tab1, tab2 = st.tabs(["📅 Отчет по движению (Неделя/Месяц)", "⚠️ Заказ (Low Stock Report)"])
+    t1, t2 = st.tabs(["Движение (История)", "Заказ (Low Stock)"])
     
-    # --- ТАБ 1: Движение ---
-    with tab1:
-        st.subheader("История операций за период")
+    with t1:
+        d1 = st.date_input("С даты", date.today().replace(day=1))
+        d2 = st.date_input("По дату", date.today())
         
-        col1, col2 = st.columns(2)
-        start_date = col1.date_input("С даты:", value=date.today().replace(day=1))
-        end_date = col2.date_input("По дату:", value=date.today())
+        # Фильтр для In и Out
+        mask_in = (st.session_state.df_in['Date'] >= d1) & (st.session_state.df_in['Date'] <= d2)
+        mask_out = (st.session_state.df_out['Date'] >= d1) & (st.session_state.df_out['Date'] <= d2)
         
-        report_type = st.radio("Тип отчета:", ["Только Расход (Out)", "Только Приход (In)"], horizontal=True)
+        st.write("📥 Приходы за период:")
+        st.dataframe(st.session_state.df_in[mask_in])
+        st.write("📤 Расходы за период:")
+        st.dataframe(st.session_state.df_out[mask_out])
         
-        if report_type == "Только Расход (Out)":
-            df_source = st.session_state.df_out
-        else:
-            df_source = st.session_state.df_in
-            
-        # Фильтрация по датам
-        mask = (df_source['Date'] >= start_date) & (df_source['Date'] <= end_date)
-        df_report = df_source.loc[mask]
+    with t2:
+        limit = st.slider("Критический уровень", 1, 20, 5)
+        low_stock = st.session_state.df_store[st.session_state.df_store['Reminder'] <= limit]
+        st.dataframe(low_stock)
         
-        st.write(f"Найдено записей: {len(df_report)}")
-        st.dataframe(df_report, use_container_width=True)
-        
-        # Кнопка скачивания
-        csv = df_report.to_csv(index=False).encode('utf-8')
         st.download_button(
-            label="⬇️ Скачать отчет (CSV/Excel)",
-            data=csv,
-            file_name=f"Report_{report_type}_{start_date}_{end_date}.csv",
-            mime='text/csv',
+            "⬇️ Скачать список для заказа (CSV)",
+            low_stock.to_csv(index=False).encode('utf-8'),
+            "order_list.csv",
+            "text/csv"
         )
 
-    # --- ТАБ 2: Order Report ---
-    with tab2:
-        st.subheader("⚠️ Список для заказа (Order List)")
-        st.markdown("Показывает товары, остаток которых ниже указанного уровня.")
-        
-        limit = st.slider("Критический уровень остатка:", 1, 50, 5)
-        
-        df_low = st.session_state.df_store[st.session_state.df_store['Reminder'] <= limit]
-        
-        st.error(f"Найдено {len(df_low)} позиций, требующих заказа!")
-        st.dataframe(df_low[['Unic_Mat_№', 'Description', 'Place', 'Reminder', 'Price']], use_container_width=True)
-        
-        csv_low = df_low.to_csv(index=False).encode('utf-8')
-        st.download_button(
-            label="⬇️ Скачать Order List для закупки",
-            data=csv_low,
-            file_name=f"Order_List_Below_{limit}.csv",
-            mime='text/csv',
-        )
-
-# ==========================================
-# 5. НАСТРОЙКИ (СБРОС С ПАРОЛЕМ)
-# ==========================================
-elif page == "⚙️ Настройки (Сброс)":
-    st.title("⚙️ Опасная зона")
+# --- 5. НАСТРОЙКИ ---
+elif page == "⚙️ Настройки":
+    st.title("Опасная зона")
+    st.warning("Сброс удалит все данные из таблицы!")
     
-    st.markdown("### 🧨 Полная очистка базы данных")
-    st.warning("Это действие удалит ВСЕ записи о приходах, расходах и обнулит склад. Отменить нельзя.")
-    
-    password = st.text_input("Введите пароль администратора:", type="password")
-    
-    if st.button("💣 СБРОСИТЬ ВСЕ ДАННЫЕ"):
-        if password == ADMIN_PASSWORD:
-            # Сброс
-            empty_store = pd.DataFrame(columns=['Unic_Mat_№', 'Description', 'Place', 'Unit', 'Reminder', 'Price', 'Group', 'Remarks'])
-            empty_in = pd.DataFrame(columns=['Unic_Mat_№', 'Description', 'QTY', 'Date', 'Delivery_man', 'Remarks'])
-            empty_out = pd.DataFrame(columns=['Unic_Mat_№', 'Description', 'QTY', 'Date', 'Applicant', 'Remarks'])
+    pwd = st.text_input("Пароль администратора", type="password")
+    if st.button("🧨 СБРОСИТЬ БАЗУ"):
+        if pwd == ADMIN_PASSWORD:
+            # Создаем пустые таблицы
+            empty_s = pd.DataFrame(columns=['Unic_Mat_№', 'Description', 'Place', 'Unit', 'Reminder', 'Price', 'Group', 'Remarks'])
+            empty_i = pd.DataFrame(columns=['Unic_Mat_№', 'Description', 'QTY', 'Date', 'Delivery_man', 'Remarks'])
+            empty_o = pd.DataFrame(columns=['Unic_Mat_№', 'Description', 'QTY', 'Date', 'Applicant', 'Remarks'])
             
-            save_sheet(empty_store, "Store")
-            save_sheet(empty_in, "In")
-            save_sheet(empty_out, "Out")
-            
-            st.session_state.data_loaded = False
-            st.success("✅ База данных полностью очищена.")
-            st.rerun()
+            save_sheet(empty_s, "Store")
+            save_sheet(empty_i, "In")
+            save_sheet(empty_o, "Out")
+            st.success("База очищена.")
+            st.cache_resource.clear()
         else:
-
-            st.error("⛔ Неверный пароль! Доступ запрещен.")
-
-
+            st.error("Неверный пароль")
