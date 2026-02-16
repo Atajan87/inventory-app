@@ -1,3 +1,4 @@
+import json  # <--- ДОБАВИТЬ ЭТУ СТРОКУ
 import streamlit as st
 import pandas as pd
 import gspread
@@ -15,26 +16,24 @@ ADMIN_PASSWORD = "admin123"
 SPREADSHEET_NAME = "Store_03_Database"
 
 # --- ПОДКЛЮЧЕНИЕ К GOOGLE SHEETS ---
+# --- НОВАЯ БРОНЕБОЙНАЯ ФУНКЦИЯ ПОДКЛЮЧЕНИЯ ---
 @st.cache_resource
 def get_connection():
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
     
-    # 1. Проверяем наличие секретов в облаке
-    if "gcp_service_account" in st.secrets:
-        creds_dict = dict(st.secrets["gcp_service_account"])
-        
-        # ЛЕЧЕНИЕ КЛЮЧА (Самая важная часть)
-        if "private_key" in creds_dict:
-            pk = creds_dict["private_key"]
-            # Если ключ пришел как одна длинная строка без реальных переносов, чиним его
-            pk = pk.replace("\\n", "\n") 
-            creds_dict["private_key"] = pk
+    # 1. Читаем секрет как строку JSON
+    if "service_account_json" in st.secrets:
+        try:
+            # Превращаем текст обратно в словарь
+            creds_dict = json.loads(st.secrets["service_account_json"])
+            creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+        except json.JSONDecodeError as e:
+            st.error(f"Ошибка в формате JSON в Secrets: {e}")
+            st.stop()
             
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-    
-    # 2. Иначе ищем локальный файл (для работы с ПК)
+    # 2. Локальный файл (если запускаем с компа)
     else:
-        creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(json.load(open("credentials.json")), scope)
         
     client = gspread.authorize(creds)
     return client
@@ -338,4 +337,5 @@ elif page == "⚙️ Настройки (Сброс)":
         else:
 
             st.error("⛔ Неверный пароль! Доступ запрещен.")
+
 
