@@ -19,18 +19,20 @@ SPREADSHEET_NAME = "Store_03_Database"
 def get_connection():
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
     
-    # 1. Пробуем взять секреты из облака
+    # 1. Проверяем наличие секретов в облаке
     if "gcp_service_account" in st.secrets:
-        # Делаем копию словаря, чтобы можно было править
         creds_dict = dict(st.secrets["gcp_service_account"])
         
-        # 🔴 ГЛАВНОЕ ИСПРАВЛЕНИЕ: Чиним переносы строк в ключе
+        # ЛЕЧЕНИЕ КЛЮЧА (Самая важная часть)
         if "private_key" in creds_dict:
-            creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
+            pk = creds_dict["private_key"]
+            # Если ключ пришел как одна длинная строка без реальных переносов, чиним его
+            pk = pk.replace("\\n", "\n") 
+            creds_dict["private_key"] = pk
             
         creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-        
-    # 2. Если секретов нет — ищем локальный файл (для компьютера)
+    
+    # 2. Иначе ищем локальный файл (для работы с ПК)
     else:
         creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
         
@@ -336,3 +338,4 @@ elif page == "⚙️ Настройки (Сброс)":
         else:
 
             st.error("⛔ Неверный пароль! Доступ запрещен.")
+
