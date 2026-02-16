@@ -19,11 +19,18 @@ SPREADSHEET_NAME = "Store_03_Database"
 def get_connection():
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
     
-    # 1. Сначала пробуем найти секреты в настройках Streamlit Cloud
+    # 1. Пробуем взять секреты из облака
     if "gcp_service_account" in st.secrets:
-        creds_dict = st.secrets["gcp_service_account"]
+        # Делаем копию словаря, чтобы можно было править
+        creds_dict = dict(st.secrets["gcp_service_account"])
+        
+        # 🔴 ГЛАВНОЕ ИСПРАВЛЕНИЕ: Чиним переносы строк в ключе
+        if "private_key" in creds_dict:
+            creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
+            
         creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-    # 2. Если не вышло — ищем локальный файл (для работы с компьютера)
+        
+    # 2. Если секретов нет — ищем локальный файл (для компьютера)
     else:
         creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
         
@@ -327,4 +334,5 @@ elif page == "⚙️ Настройки (Сброс)":
             st.success("✅ База данных полностью очищена.")
             st.rerun()
         else:
+
             st.error("⛔ Неверный пароль! Доступ запрещен.")
